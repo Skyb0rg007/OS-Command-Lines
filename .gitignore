@@ -1,4 +1,5 @@
 *.o
 *.obj
 *.exe
+*.nativecodeanalysis.xml
 linux-startup/parrot
