@@ -1,33 +1,42 @@
 
 #include <windows.h>
 #include <winternl.h>
+#include <stdarg.h>
 
-static TEB *get_teb(void);
-static void console_log(void *handle, const wchar_t *fmt, ...);
+/* Custom fwprintf implementation that escapes strings */
+static int my_fwprintf(void *handle, _Printf_format_string_ const wchar_t *format, ...);
+/* Implements NtCurrentTeb() */
+_Ret_notnull_ static TEB *get_teb(void);
 
 int __stdcall _start(void)
 {
-    AttachConsole(ATTACH_PARENT_PROCESS);
-    void *stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
-
     TEB *teb = get_teb();
     PEB *peb = teb->ProcessEnvironmentBlock;
     RTL_USER_PROCESS_PARAMETERS *params = peb->ProcessParameters;
     wchar_t *lpCmdLine = params->CommandLine.Buffer;
-    wchar_t *lpEnv = *(wchar_t **)(params + 1);
+    /* The environment pointer is undocumented,
+     * but is located directly after the CommandLine field
+     * This is the same as GetEnvironmentStringsW, though the Win32 function
+     * performs a copy and needs to be free-d */
+    wchar_t *lpEnv = *(wchar_t **)(
+            (char *)&params->CommandLine + sizeof(params->CommandLine));
 
-    console_log(stdOut, L"\r\n");
+    /* Need to use kernel32.lib functions to write to a console */
+    int consoleSpawned = AttachConsole(ATTACH_PARENT_PROCESS);
+    void *stdOut = GetStdHandle(STD_OUTPUT_HANDLE);
 
-    console_log(stdOut, L"lpCmdLine = \"%1!s!\"\r\n", lpCmdLine);
+    /* cmd.exe prints a new prompt so we need this to start on a new line */
+    my_fwprintf(stdOut, L"\r\n");
+
+    my_fwprintf(stdOut, L"lpCmdLine = %s\r\n", lpCmdLine);
 
     {
         int argc;
         wchar_t **argv = CommandLineToArgvW(lpCmdLine, &argc);
-        wchar_t *lpEnv = GetEnvironmentStringsW();
 
-        console_log(stdOut, L"argc = %1!d!\r\n", argc);
+        my_fwprintf(stdOut, L"argc = %d\r\n", argc);
         for (int i = 0; i < argc; i++) {
-            console_log(stdOut, L"argv[%1!d!] = \"%2!s!\"\r\n", i, argv[i]);
+            my_fwprintf(stdOut, L"argv[%d] = %s\r\n", i, argv[i]);
         }
 
         LocalFree(argv);
@@ -36,30 +45,18 @@ int __stdcall _start(void)
     {
         wchar_t *p = lpEnv;
         for (int i = 0; *p != L'\0'; i++) {
-            console_log(stdOut, L"lpEnv[%1!d!] = \"%2!s!\"\r\n", i, p);
-            p += lstrlenW(p) + 1;
+            my_fwprintf(stdOut, L"lpEnv[%d] = %s\r\n", i, p);
+            while (*p)
+                p++;
+            p++;
         }
     }
 
     ExitProcess(0);
 }
 
-static void console_log(void *handle, const wchar_t *fmt, ...)
-{
-    static wchar_t buf[2048];
-    unsigned long len;
-    va_list args;
-    va_start(args, fmt);
-
-    len = FormatMessage(
-            FORMAT_MESSAGE_FROM_STRING,
-            fmt, 0, 0, buf, 2048, &args);
-    va_end(args);
-
-    WriteConsoleW(handle, buf, len, NULL, NULL);
-}
-
-// Inlined from winnt.h
+/* Inlined from NtCurrentTeb */
+_Ret_notnull_
 static TEB *get_teb(void) {
 #if defined(_M_AMD64) && !defined(_M_ARM64EC) && !defined(__midl)
     return (TEB *)__readgsqword(offsetof(NT_TIB, Self));
@@ -74,4 +71,88 @@ static TEB *get_teb(void) {
 #endif
 }
 
+static int my_fwprintf(void *handle, _Printf_format_string_ const wchar_t *format, ...)
+{
+#define my_fwprintf_bufsize 2048
+    unsigned long n = 0;
+    wchar_t c;
+    int i;
+    const wchar_t *s;
+    va_list args;
+    static wchar_t buf[my_fwprintf_bufsize];
+
+#define my_fwprintf_putc(c)                       \
+    do {                                         \
+        buf[n++] = (c);                          \
+        if (n >= my_fwprintf_bufsize) goto error; \
+    } while (0)
+
+    va_start(args, format);
+
+    while ((c = *format++)) {
+        if (c != L'%') {
+            my_fwprintf_putc(c);
+            continue;
+        }
+        switch ((c = *format++)) {
+            case L'd':
+                i = va_arg(args, int);
+                if (i < 0) {
+                    my_fwprintf_putc(L'-');
+                }
+                if (i == 0) {
+                    my_fwprintf_putc(L'0');
+                } else {
+                    unsigned d = 1;
+                    while (i / d >= 10)
+                        d *= 10;
+
+                    while (d != 0) {
+                        int digit = i / d;
+                        i %= d;
+                        d /= 10;
+                        if (digit > 0 || d == 0)
+                            my_fwprintf_putc(L'0' + digit);
+                    }
+                }
+                break;
+            case L's':
+                s = va_arg(args, const wchar_t *);
+                if (s == NULL) {
+                    my_fwprintf_putc(L'N');
+                    my_fwprintf_putc(L'U');
+                    my_fwprintf_putc(L'L');
+                    my_fwprintf_putc(L'L');
+                    break;
+                }
+                my_fwprintf_putc(L'\"');
+                while ((c = *s++)) {
+                    /* TODO: Handle non-printable characters */
+                    if (c == L'\"' || c == L'\\')
+                        my_fwprintf_putc(L'\\');
+                    my_fwprintf_putc(c);
+                }
+                my_fwprintf_putc(L'\"');
+                break;
+            case L'%':
+                my_fwprintf_putc(L'%');
+                break;
+            default:
+                goto error;
+        }
+    }
+
+    va_end(args);
+    WriteConsoleW(handle, buf, n, NULL, NULL);
+    if (n > (unsigned long)INT_MAX)
+        return INT_MAX;
+    return (int)n;
+
+error:
+    va_end(args);
+    return -1;
+
+#undef my_fwprintf_putc
+#undef my_fwprintf_bufsize
+}
 

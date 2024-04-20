@@ -5,7 +5,7 @@
 #include <stdarg.h>
 #include <limits.h>
 
-static int my_snprintf(char *str, size_t size, const char *format, ...) __attribute__((__nonnull__(1, 3), __format__(__printf__, 3, 4)));
+static int my_fprintf(uint64_t fd, const char *format, ...) __attribute__((__nonnull__(2), __format__(__printf__, 2, 3)));
 static int64_t sys_write(uint64_t fd, const char *buf, uint64_t count) __attribute__((__nonnull__(2)));
 static void sys_exit(uint64_t code) __attribute__((__noreturn__));
 
@@ -28,20 +28,14 @@ static void _start_c(uint64_t *rsp) {
     char **argv = (char **)&rsp[1];
     char **envp = (char **)&rsp[1 + argc + 1];
 
-    static char buf[2048];
-    int len;
-
     for (int i = 0; i < argc; i++) {
-        len = my_snprintf(buf, sizeof buf, "argv[%d] = \"%s\"\n", i, argv[i]);
-        sys_write(STDOUT_FILENO, buf, len);
+        my_fprintf(STDOUT_FILENO, "argv[%d] = %s\n", i, argv[i]);
     }
 
-    len = my_snprintf(buf, sizeof buf, "------------------------------\n");
-    sys_write(STDOUT_FILENO, buf, len);
+    my_fprintf(STDOUT_FILENO, "-----------------------\n");
 
     for (int i = 0; envp[i] != NULL; i++) {
-        len = my_snprintf(buf, sizeof buf, "envp[%d] = \"%s\"\n", i, envp[i]);
-        sys_write(STDOUT_FILENO, buf, len);
+        my_fprintf(STDOUT_FILENO, "envp[%d] = %s\n", i, envp[i]);
     }
     sys_exit(0);
 }
@@ -67,71 +61,91 @@ static void sys_exit(uint64_t code)
     __builtin_unreachable();
 }
 
-static int my_snprintf(char *str, size_t size, const char *format, ...)
+static int my_fprintf(uint64_t fd, const char *format, ...)
 {
-    size_t n = 0;
+#define my_fprintf_bufsize 2048
+    uint64_t n = 0;
     char c;
+    int i;
+    const char *s;
     va_list args;
+    static char buf[my_fprintf_bufsize];
 
-    if (size >= (size_t)INT_MAX)
-        return -1;
+#define my_fprintf_putc(c)             \
+    do {                              \
+        buf[n++] = (c);               \
+        if (n >= my_fprintf_bufsize) { \
+            n = my_fprintf_bufsize;    \
+            goto done;                \
+        }                             \
+    } while (0)
 
     va_start(args, format);
 
-    while (n < size && (c = *format++)) {
+    while ((c = *format++)) {
         if (c != '%') {
-            str[n++] = c;
-        } else {
-            switch (*format++) {
-                case 'd': {
-                    int i = va_arg(args, int);
-                    if (i < 0) {
-                        str[n++] = '-';
-                        if (n == size)
-                            goto end;
-                    }
-                    if (i == 0) {
-                        str[n++] = '0';
-                    } else {
-                        unsigned d = 1;
-                        while (i / d >= 10)
-                            d *= 10;
+            my_fprintf_putc(c);
+            continue;
+        }
+        switch ((c = *format++)) {
+            case 'd':
+                i = va_arg(args, int);
+                if (i < 0) {
+                    my_fprintf_putc('-');
+                }
+                if (i == 0) {
+                    my_fprintf_putc('0');
+                } else {
+                    unsigned d = 1;
+                    while (i / d >= 10)
+                        d *= 10;
 
-                        while (d != 0) {
-                            int digit = i / d;
-                            i %= d;
-                            d /= 10;
-                            if (digit > 0 || d == 0) {
-                                str[n++] = '0' + digit;
-                                if (n == size)
-                                    goto end;
-                            }
-                        }
+                    while (d != 0) {
+                        int digit = i / d;
+                        i %= d;
+                        d /= 10;
+                        if (digit > 0 || d == 0)
+                            my_fprintf_putc('0' + digit);
                     }
-
+                }
+                break;
+            case 's':
+                s = va_arg(args, const char *);
+                if (s == NULL) {
+                    my_fprintf_putc('N');
+                    my_fprintf_putc('U');
+                    my_fprintf_putc('L');
+                    my_fprintf_putc('L');
                     break;
                 }
-                case 's': {
-                    const char *s = va_arg(args, const char *);
-                    if (s == NULL)
-                        s = "(null)";
-                    while (*s) {
-                        if (n == size) goto end;
-                        str[n++] = *s++;
-                    }
-                    break;
+                my_fprintf_putc('\"');
+                while ((c = *s++)) {
+                    /* TODO: Handle non-printable characters */
+                    if (c == '\"' || c == '\\')
+                        my_fprintf_putc('\\');
+                    my_fprintf_putc(c);
                 }
-                default:
-                    return -1;
-            }
+                my_fprintf_putc('\"');
+                break;
+            case '%':
+                my_fprintf_putc('%');
+                break;
+            default:
+                goto error;
         }
     }
 
+done:
     va_end(args);
-    n++;
-
-end:
-    str[n - 1] = '\0';
+    sys_write(fd, buf, n);
+    if (n > (uint64_t)INT_MAX)
+        return INT_MAX;
     return (int)n;
-}
 
+error:
+    va_end(args);
+    return -1;
+
+#undef my_fprintf_putc
+#undef my_fprintf_bufsize
+}
